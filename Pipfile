@@ -4,7 +4,9 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-transformers = "*"
+pynacl = "*"
+torch = "*"
+transformers = {git = "git+https://github.com/huggingface/transformers"}
 
 [dev-packages]
 

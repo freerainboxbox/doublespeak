@@ -7,7 +7,7 @@ Inspired by [LLuffman](https://botnoise.org/~pokes/lluffman/)
 
 ## How does this work?
 
-Using the lightweight [Phi-3-mini-128k-instruct-onnx](https://huggingface.co/microsoft/Phi-3-mini-128k-instruct-onnx) model and a shared system prompt to complete, we do the following to hide text inside an innocuous block of LLM generated text:
+Using the lightweight [Phi-3-mini-128k-instruct](https://huggingface.co/microsoft/Phi-3-mini-128k-instruct) model and a shared system prompt to complete, we do the following to hide text inside an innocuous block of LLM generated text:
 
 1. Compress our text using `lzma`: `comp_text = lzma(text)`
 2. Demarcate text boundary using `comp_text = comp_text||0x03`
