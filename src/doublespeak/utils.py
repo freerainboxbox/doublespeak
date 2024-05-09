@@ -2,6 +2,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import lzma
 from nacl import pwhash, secret
 from nacl import utils as nacl_utils
+from typing import List
+from secrets import randbelow
+CPU = -1
+
+def sec_randfloat() -> float:
+    return randbelow(2**32) / 2**32
 
 tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-128k-instruct", trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained("microsoft/Phi-3-mini-128k-instruct", trust_remote_code=True)
@@ -41,10 +47,11 @@ codebook = (
     (True, True, True, True),
 )
 
+CODEBOOK_SIZE = len(codebook)
 
 # NOTE: SecretMessage is meant to be immutable
 class SecretMessage:
-    ciphertext: str
+    ciphertext: bytes
     plaintext: str
 
 class SecretMessageFactory:
@@ -61,7 +68,7 @@ class SecretMessageFactory:
         nonce = nacl_utils.random(secret.SecretBox.NONCE_SIZE)
         ciphertext = box.encrypt(plaintext_bytes, nonce)
         sm = SecretMessage()
-        sm.ciphertext = salt + ciphertext
+        sm.ciphertext = salt + ciphertext + bytes.fromhex("03")
         sm.plaintext = plaintext
         return sm
     @staticmethod
@@ -79,40 +86,65 @@ class SecretMessageFactory:
         sm.plaintext = plaintext
         return sm
 
+def get_codebook_indices(ciphertext: List[bool], cur_index: int) -> list:
+    codebook_indices = None
+    max_bits = min(4, len(sm.ciphertext) - cur_index)
+    match max_bits:
+        case 1:
+            codebook_indices = ciphertext[cur_index]
+        case 2:
+            bits = ciphertext[cur_index:cur_index+2]
+            for i, code in enumerate(codebook[:5]):
+                if code == bits:
+                    codebook_indices.append(i)
+        case 3:
+            bits = ciphertext[cur_index:cur_index+3]
+            for i, code in enumerate(codebook[:13]):
+                if code == bits:
+                    codebook_indices.append(i+5)
+        case 4:
+            bits = ciphertext[cur_index:cur_index+4]
+            for i, code in enumerate(codebook):
+                if code == bits:
+                    codebook_indices.append(i+13)
+    return codebook_indices
+
 class HiddenMonologue:
     def __init__(self, tokenizer: AutoTokenizer, model, system_prompt: str, password: str):
         self.tokenizer = tokenizer
         self.model = model
         # Set chat template with system prompt, and empty first message for assistant to go first
-        self.chat = tokenizer.tokenize("<|system|>"+system_prompt+"<|end|>\n<|assistant|>")
+        self.chat = "<|system|>"+system_prompt+"<|end|>\n<|assistant|>"
         self.password = password
     def encode(self, plaintext):
         sm = SecretMessageFactory.fromPlaintext(plaintext, self.password)
         ciphertext = struct.unpack("?", sm.ciphertext)
         cur_index = 0
         # Create a fill_mask pipeline
-        fill_mask = pipeline("fill-mask", model=self.model, tokenizer=self.tokenizer, top_k=30, device=-1)
+        fill_mask = pipeline("fill-mask", model=self.model, tokenizer=self.tokenizer, top_k=CODEBOOK_SIZE, device=CPU)
         while cur_index < len(ciphertext):
-            # Get the next 4 bits
-            bits = ciphertext[cur_index:cur_index+4]
-            # Get the indices of the codebook that match the bits (checks up to size of code)
-            indices = [i for i, x in enumerate(codebook) if x == bits]
-            # Get the tokens that match the indices
-            tokens = [self.tokenizer.decode(i) for i in indices]
-            # Zero out all other logits
-            for i in range(len(fill_mask.tokenizer)):
-                if i not in indices:
-                    fill_mask.logits[i] = 0
-            # Renormalize the logits to sum to 1.0
-            fill_mask.logits = fill_mask.logits / sum(fill_mask.logits)
-            # Sample from the distribution
-            token = fill_mask()
-            # Append the token to the chat
-            self.chat.append(token)
-            cur_index += 4
-            #TODO Validate this code
-
-
+            next_tokens = fill_mask(self.chat+"<mask>")
+            # Zero out all scores except for the ones that match the codebook
+            codebook_indices = get_codebook_indices(ciphertext, cur_index)
+            total = 0
+            for i in range(CODEBOOK_SIZE):
+                if i not in codebook_indices:
+                    next_tokens[0]["scores"][i] = 0
+                else:
+                    total += next_tokens[0]["scores"][i]
+            # Renormalize the scores to sum to 1.0
+            for i in range(CODEBOOK_SIZE):
+                next_tokens[0]["scores"][i] /= total
+            # Randomly sample from the distribution
+            rand = sec_randfloat()
+            # Find smallest score above or equal to rand
+            for i in range(CODEBOOK_SIZE):
+                if next_tokens[0]["scores"][i] >= rand:
+                    break
+                rand -= next_tokens[0]["scores"][i]
+            cur_index += len(codebook[codebook_indices[i]])
+            self.chat = next_tokens[i]["sequence"]
+        # Complete the chat normally using generate
 
     def decode(self, ciphertext):
         pass
