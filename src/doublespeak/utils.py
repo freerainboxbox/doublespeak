@@ -113,10 +113,14 @@ class HiddenMonologue:
     def __init__(self, tokenizer: AutoTokenizer, model, system_prompt: str, password: str):
         self.tokenizer = tokenizer
         self.model = model
+        self.system_prompt = system_prompt
         # Set chat template with system prompt, and empty first message for assistant to go first
-        self.chat = "<|system|>"+system_prompt+"<|end|>\n<|assistant|>"
+        self.chat = None
         self.password = password
-    def encode(self, plaintext):
+    def reset_chat(self):
+        self.chat = "<|system|>"+self.system_prompt+"<|end|>\n<|assistant|>"
+    def encode(self, plaintext) -> str:
+        self.reset_chat()
         sm = SecretMessageFactory.fromPlaintext(plaintext, self.password)
         ciphertext = struct.unpack("?", sm.ciphertext)
         cur_index = 0
@@ -144,12 +148,16 @@ class HiddenMonologue:
                 rand -= next_tokens[0]["scores"][i]
             cur_index += len(codebook[codebook_indices[i]])
             self.chat = next_tokens[i]["sequence"]
-        # Complete the chat normally using generate
+        # Complete the chat normally using text-generation
+        generate_padding = pipeline("text-generation", model=self.model, tokenizer=self.tokenizer, num_return_sequences=1, device=CPU)
+        self.chat = generate_padding(self.chat)[0]["generated_text"]
+        return self.chat
 
-    def decode(self, ciphertext):
-        pass
-        # TODO finish decode method
-    
+    def decode(self, llm_generated_text: str) -> str:
+        self.reset_chat()
+        self.chat += llm_generated_text
+        # TODO: finish decode method
+
 
 
 class HiddenConversation:
