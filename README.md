@@ -19,7 +19,7 @@ Using the lightweight [Phi-3-mini-128k-instruct](https://huggingface.co/microsof
 8. Continue generating top-30 tokens with randomness until `<|endoftext|>`
 9. Return the final encoded block of text, and send over an insecure channel.
 
-We can then decode by reverse-matching the predictions to our code-table to reconstruct the ciphertext, stopping at `0x03`, then decrypting and uncompressing.
+We can then decode by reverse-matching the predictions to our code-table to reconstruct the ciphertext, stopping at `0x03`, then decrypting and uncompressing. If the MAC doesn't match, keep trying every `0x03` until it works, otherwise return an error.
 
 Conversations may also work, as long as total conversation length + system prompt does not exceed the 128k window. The ciphertext is always aligned at the message boundary in this case.
 
