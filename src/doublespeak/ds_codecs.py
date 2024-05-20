@@ -6,6 +6,7 @@ import lzma
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from nacl import pwhash, secret
 from nacl import utils as nacl_utils
+from nacl.exceptions import CryptoError
 from blake3 import blake3
 import torch
 
@@ -76,8 +77,11 @@ class _SecretMessageFactory:
                 if candidate_mac == computed_mac:
                     sm = _SecretMessage()
                     sm.ciphertext = ciphertext[:i]
-                    sm.plaintext = lzma.decompress(box.decrypt(sm.ciphertext)).decode()
-                    return sm
+                    try:
+                        sm.plaintext = lzma.decompress(box.decrypt(sm.ciphertext)).decode()
+                        return sm
+                    except CryptoError:
+                        pass
         if not eot_detected:
             raise ValueError("No end-of-transmission marker found in ciphertext. Is the message corrupted?")
         else:
