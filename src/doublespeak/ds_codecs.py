@@ -1,6 +1,5 @@
 from typing import List, Tuple, Optional
 from secrets import randbelow
-from struct import pack, unpack
 import lzma
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
@@ -30,6 +29,14 @@ def gen_codebook(num_bits: int):
 codebook = gen_codebook(4)
 
 CODEBOOK_SIZE = len(codebook)
+
+def _bytes_to_bools(bytestream: bytes) -> List[bool]:
+    """Converts a bytestream into a list of bits."""
+    return [int(bit) for byte in bytestream for bit in f"{byte:08b}"]
+
+def _bools_to_bytes(bits: List[bool]) -> bytes:
+    """Converts a list of bits into a bytestream."""
+    return bytes(int("".join(map(str, bits[i:i+8])), 2) for i in range(0, len(bits), 8))
 
 # NOTE: _SecretMessage is meant to be immutable
 class _SecretMessage:
@@ -68,7 +75,6 @@ class _SecretMessageFactory:
         key_mac = kdf(blake3.key_size, password.encode(), salt, pwhash.argon2id.OPSLIMIT_SENSITIVE, pwhash.argon2id.MEMLIMIT_SENSITIVE)
         box = secret.SecretBox(key_symmetric)
         eot_detected = False
-        assert len(ciphertext) > BLAKE3_DIGEST_SIZE+1
         for i, read_head in enumerate(ciphertext[:-BLAKE3_DIGEST_SIZE-1]):
             if read_head == 0x03:
                 eot_detected = True
@@ -87,29 +93,20 @@ class _SecretMessageFactory:
         else:
             raise ValueError("No valid MAC found in ciphertext. Is the message corrupted or was the password incorrect?")
 
-def get_codebook_indices(ciphertext: List[bool], cur_index: int) -> list:
+def get_codebook_indices(ciphertext: List[bool], cur_index: int) -> List[int]:
     """Given a ciphertext and the read head position, returns the indices in the codebook that match the next 1, 2, 3, or 4 bits."""
-    codebook_indices = None
+    codebook_indices = []
     max_bits = min(4, len(ciphertext) - cur_index)
-    match max_bits:
-        case 1:
-            codebook_indices = ciphertext[cur_index]
-        case 2:
-            bits = ciphertext[cur_index:cur_index+2]
-            for i, code in enumerate(codebook[:5]):
-                if code == bits:
-                    codebook_indices.append(i)
-        case 3:
-            bits = ciphertext[cur_index:cur_index+3]
-            for i, code in enumerate(codebook[:13]):
-                if code == bits:
-                    codebook_indices.append(i+5)
-        case 4:
-            bits = ciphertext[cur_index:cur_index+4]
-            for i, code in enumerate(codebook):
-                if code == bits:
-                    codebook_indices.append(i+13)
+    for i in range(2**(max_bits+1)-2):
+        valid = True
+        for pos, bit in enumerate(codebook[i]):
+            if bit != ciphertext[cur_index + pos]:
+                valid = False
+                break
+        if valid:
+            codebook_indices.append(i)
     return codebook_indices
+        
 
 class HiddenMonologue:
     def __init__(self, tokenizer: AutoTokenizer, model: AutoModelForCausalLM, system_prompt: str, password: str):
@@ -124,7 +121,7 @@ class HiddenMonologue:
         tokens_so_far = tokenized_chat
         tokens_so_far["input_ids"] = tokens_so_far["input_ids"][:token_decoding_index]
         with torch.no_grad():
-            logits = self.model(**).logits
+            logits = self.model(**tokens_so_far).logits
             probs = torch.softmax(logits, dim=-1)
             top_probs, top_idxs = torch.topk(probs[0, -1], k=CODEBOOK_SIZE)
         # Sort in descending order of probabilities
@@ -142,6 +139,8 @@ class HiddenMonologue:
             top_probs, top_idxs = torch.topk(probs[0, -1], k=CODEBOOK_SIZE)
         # Sort in descending order of probabilities
         top_probs, top_idxs = zip(*sorted(zip(top_probs, top_idxs), reverse=True))
+        top_probs = list(top_probs)
+        top_idxs = list(top_idxs)
         # Determine possible codebook indices
         codebook_indices = get_codebook_indices(ciphertext, cur_index)
         # Zero out all scores except for the ones that match the codebook
@@ -160,19 +159,19 @@ class HiddenMonologue:
         rand = _sec_randfloat()
         for i in range(CODEBOOK_SIZE):
             if top_probs[i] >= rand:
-                break
+                return self.tokenizer.decode(top_idxs[i]), len(codebook[i])
             rand -= top_probs[i]
-        return self.tokenizer.decode(codebook[top_idxs[i]]), len(codebook[top_idxs[i]])
     def reset_chat(self):
         self.chat = "<|system|>"+self.system_prompt+"<|end|>\n<|assistant|>"
     def encode(self, plaintext) -> str:
         """Encrypts a plaintext message into ciphertext using the password, then encodes it into a monologue."""
         self.reset_chat()
         sm = _SecretMessageFactory.from_plaintext(plaintext, self.password)
-        ciphertext = unpack("?", sm.ciphertext)
+        ciphertext = _bytes_to_bools(sm.ciphertext)
         cur_index = 0
         while cur_index < len(ciphertext):
             token, consumed_bits = self.encode_bits(ciphertext, cur_index, self.chat)
+            print(token, end=" ")
             self.chat += token
             cur_index += consumed_bits
         # If we are not at <|end|> yet, continue the conversation with normal generation
@@ -189,7 +188,7 @@ class HiddenMonologue:
         for token_decoding_index in range(tokenized_chat["input_ids"]):
             ciphertext += codebook[self.decode_recent_token(tokenized_chat, token_decoding_index)]
         # Pack into a bytestring, and then decrypt
-        sm = _SecretMessageFactory.from_ciphertext(pack("?", ciphertext), self.password)
+        sm = _SecretMessageFactory.from_ciphertext(_bools_to_bytes(ciphertext), self.password)
         return sm.plaintext
 
 class HiddenConversation:

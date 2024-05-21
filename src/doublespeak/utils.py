@@ -1,4 +1,4 @@
-from . import ds_codecs
+import ds_codecs
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # USER: You MUST specify a revision to ensure reproducibility
