@@ -6,11 +6,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from nacl import pwhash, secret
 from nacl import utils as nacl_utils
 from nacl.exceptions import CryptoError
-from blake3 import blake3
+import blake3
 import torch
 
 CPU = -1
 BLAKE3_DIGEST_SIZE = 32
+BLAKE3_KEY_SIZE = 32
 
 def _sec_randfloat() -> float:
     """Securely returns a uniformly random float in [0.0, 1.0), for selecting tokens from probability distribution."""
@@ -27,6 +28,10 @@ def gen_codebook(num_bits: int):
     return tuple(codebook)
 
 codebook = gen_codebook(4)
+
+def pp_codebook_id(codebook_id: int) -> str:
+    """Pretty-prints a codebook ID as a binary string."""
+    return " ".join(map(str, codebook[codebook_id]))
 
 CODEBOOK_SIZE = len(codebook)
 
@@ -54,11 +59,11 @@ class _SecretMessageFactory:
         # fixed length, goes before ciphertext but is treated as portion of ciphertext to user
         salt: bytes = nacl_utils.random(pwhash.argon2id.SALTBYTES)
         key_symmetric: bytes = kdf(secret.SecretBox.KEY_SIZE, password.encode(), salt, pwhash.argon2id.OPSLIMIT_SENSITIVE, pwhash.argon2id.MEMLIMIT_SENSITIVE)
-        key_mac: bytes = kdf(blake3.key_size, password.encode(), salt, pwhash.argon2id.OPSLIMIT_SENSITIVE, pwhash.argon2id.MEMLIMIT_SENSITIVE)
+        key_mac: bytes = kdf(BLAKE3_KEY_SIZE, password.encode(), salt, pwhash.argon2id.OPSLIMIT_SENSITIVE, pwhash.argon2id.MEMLIMIT_SENSITIVE)
         box: secret.SecretBox = secret.SecretBox(key_symmetric)
         nonce: bytes = nacl_utils.random(secret.SecretBox.NONCE_SIZE)
         ciphertext: bytes = box.encrypt(plaintext_bytes, nonce)
-        mac_chksum: bytes = blake3(ciphertext, key=key_mac).digest(length=BLAKE3_DIGEST_SIZE)
+        mac_chksum: bytes = blake3.blake3(ciphertext, key=key_mac).digest(length=BLAKE3_DIGEST_SIZE)
         sm = _SecretMessage()
         # Whenever 0x03 is found, the decoder will check if the following MAC is valid, terminating if it is.
         # This prevents the environment from figuring out that there is a hidden message since the MAC will appear random.
@@ -72,14 +77,14 @@ class _SecretMessageFactory:
         ciphertext = ciphertext[pwhash.argon2id.SALTBYTES:]
         kdf = pwhash.argon2id.kdf
         key_symmetric = kdf(secret.SecretBox.KEY_SIZE, password.encode(), salt, pwhash.argon2id.OPSLIMIT_SENSITIVE, pwhash.argon2id.MEMLIMIT_SENSITIVE)
-        key_mac = kdf(blake3.key_size, password.encode(), salt, pwhash.argon2id.OPSLIMIT_SENSITIVE, pwhash.argon2id.MEMLIMIT_SENSITIVE)
+        key_mac = kdf(BLAKE3_KEY_SIZE, password.encode(), salt, pwhash.argon2id.OPSLIMIT_SENSITIVE, pwhash.argon2id.MEMLIMIT_SENSITIVE)
         box = secret.SecretBox(key_symmetric)
         eot_detected = False
         for i, read_head in enumerate(ciphertext[:-BLAKE3_DIGEST_SIZE-1]):
             if read_head == 0x03:
                 eot_detected = True
                 candidate_mac = ciphertext[i+1:i+1+BLAKE3_DIGEST_SIZE]
-                computed_mac = blake3(ciphertext[:i], key=key_mac).digest(length=BLAKE3_DIGEST_SIZE)
+                computed_mac = blake3.blake3(ciphertext[:i], key=key_mac).digest(length=BLAKE3_DIGEST_SIZE)
                 if candidate_mac == computed_mac:
                     sm = _SecretMessage()
                     sm.ciphertext = ciphertext[:i]
@@ -90,8 +95,7 @@ class _SecretMessageFactory:
                         pass
         if not eot_detected:
             raise ValueError("No end-of-transmission marker found in ciphertext. Is the message corrupted?")
-        else:
-            raise ValueError("No valid MAC found in ciphertext. Is the message corrupted or was the password incorrect?")
+        raise ValueError("No valid MAC found in ciphertext. Is the message corrupted or was the password incorrect?")
 
 def get_codebook_indices(ciphertext: List[bool], cur_index: int) -> List[int]:
     """Given a ciphertext and the read head position, returns the indices in the codebook that match the next 1, 2, 3, or 4 bits."""
@@ -105,6 +109,8 @@ def get_codebook_indices(ciphertext: List[bool], cur_index: int) -> List[int]:
                 break
         if valid:
             codebook_indices.append(i)
+    if len(codebook_indices) > 4:
+        return codebook_indices[:4] # BUG: For some reason, occasionally the codebook will contain a fifth [True, True, True, True] entry, but is otherwise correct.
     return codebook_indices
         
 
@@ -155,28 +161,35 @@ class HiddenMonologue:
             top_probs[i] /= total
         # Ensure sum is 1.0 in case of floating point errors
         top_probs[-1] = 1 - sum(top_probs[:-1])
+        # Show eligible tokens
+        print("[")
+        for i in range(CODEBOOK_SIZE):
+            if top_probs[i] > 0:
+                print(f"    {i} (codeword: {pp_codebook_id(i)}, {top_probs[i]*100:.2f}%): \"{self.tokenizer.decode(top_idxs[i], clean_up_tokenization_spaces=False)}\",")
+        print("],")
         # Randomly sample from the distribution
         rand = _sec_randfloat()
         for i in range(CODEBOOK_SIZE):
             if top_probs[i] >= rand:
-                return self.tokenizer.decode(top_idxs[i]), len(codebook[i])
+                print(f"Selected token: {i} (codeword: {pp_codebook_id(i)}, {top_probs[i]*100:.2f}%): \"{self.tokenizer.decode(top_idxs[i], clean_up_tokenization_spaces=False)}\"\n-----------------")
+                return self.tokenizer.decode(top_idxs[i], clean_up_tokenization_spaces=False), len(codebook[i])
             rand -= top_probs[i]
     def reset_chat(self):
         self.chat = "<|system|>"+self.system_prompt+"<|end|>\n<|assistant|>"
     def encode(self, plaintext) -> str:
         """Encrypts a plaintext message into ciphertext using the password, then encodes it into a monologue."""
+        # TODO: It turns out that using text directly is lossy and doesn't preserve spaces. This has to be refactored to use token lists and only decode at the final step. Add a token list to the class and refactor the code to use it.
         self.reset_chat()
         sm = _SecretMessageFactory.from_plaintext(plaintext, self.password)
         ciphertext = _bytes_to_bools(sm.ciphertext)
         cur_index = 0
         while cur_index < len(ciphertext):
             token, consumed_bits = self.encode_bits(ciphertext, cur_index, self.chat)
-            print(token, end=" ")
             self.chat += token
             cur_index += consumed_bits
         # If we are not at <|end|> yet, continue the conversation with normal generation
         if "<|end|>" not in self.chat:
-            self.chat += self.tokenizer.decode(self.model.generate(self.tokenizer(self.chat, return_tensors="pt")["input_ids"], max_length=512, do_sample=True, pad_token_id=self.tokenizer.eos_token_id, num_return_sequences=1)[0])
+            self.chat += self.tokenizer.decode(self.model.generate(self.tokenizer(self.chat, return_tensors="pt")["input_ids"], max_length=512, do_sample=True, pad_token_id=self.tokenizer.eos_token_id, num_return_sequences=1)[0], clean_up_tokenization_spaces=False)
         return self.chat
     def decode(self, llm_generated_text: str) -> str:
         """Decodes a hidden plaintext message from a block of text, encrypted."""
