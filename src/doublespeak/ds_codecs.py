@@ -31,7 +31,10 @@ codebook = gen_codebook(4)
 
 def pp_codebook_id(codebook_id: int) -> str:
     """Pretty-prints a codebook ID as a binary string."""
-    return " ".join(map(str, codebook[codebook_id]))
+    output = "0b"
+    for bit in codebook[codebook_id]:
+        output += "1" if bit else "0"
+    return output
 
 CODEBOOK_SIZE = len(codebook)
 
