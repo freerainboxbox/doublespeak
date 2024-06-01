@@ -2,7 +2,7 @@ from typing import List, Tuple, Optional
 from secrets import randbelow
 import lzma
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from nacl import pwhash, secret
 from nacl import utils as nacl_utils
 from nacl.exceptions import CryptoError
@@ -58,7 +58,7 @@ class _SecretMessageFactory:
         plaintext_bytes: bytes = plaintext.encode()
         # preset must be 9 as this process is already very space-inefficient
         plaintext_bytes: bytes = lzma.compress(plaintext_bytes, preset=9)
-        kdf: function = pwhash.argon2id.kdf
+        kdf: callable = pwhash.argon2id.kdf
         # fixed length, goes before ciphertext but is treated as portion of ciphertext to user
         salt: bytes = nacl_utils.random(pwhash.argon2id.SALTBYTES)
         key_symmetric: bytes = kdf(secret.SecretBox.KEY_SIZE, password.encode(), salt, pwhash.argon2id.OPSLIMIT_SENSITIVE, pwhash.argon2id.MEMLIMIT_SENSITIVE)
@@ -113,7 +113,7 @@ def get_codebook_indices(ciphertext: List[bool], cur_index: int) -> List[int]:
         if valid:
             codebook_indices.append(i)
     if len(codebook_indices) > 4:
-        return codebook_indices[:4] # BUG: For some reason, occasionally the codebook will contain a fifth [True, True, True, True] entry, but is otherwise correct.
+        return codebook_indices[:3] # BUG: For some reason, occasionally the codebook will contain a fifth [True, True, True, True] entry, but is otherwise correct.
     return codebook_indices
         
 
@@ -124,6 +124,8 @@ class HiddenMonologue:
         self.system_prompt: str = system_prompt
         # Set chat template with system prompt, and empty first message for assistant to go first
         self.chat: Optional[str] = None
+        self.token_sequence: Optional[List[int]] = None
+        self.output_start_index: Optional[int] = None # Index of the first token of the assistant's output (after <|assistant|>)
         self.password = password
     def decode_recent_token(self, tokenized_chat, token_decoding_index: int) -> int:
         """Returns the index in codebook corresponding the last token of the tokenized running chat."""
@@ -139,23 +141,36 @@ class HiddenMonologue:
         for i in range(CODEBOOK_SIZE):
             if codebook[top_idxs[i]] == tokens_so_far["input_ids"][-1]:
                 return i
-    def encode_bits(self, ciphertext: List[bool], cur_index: int, context: str) -> Tuple[str, int]:
-        """At the current position of the ciphertext, return a decoded token and the number of bits consumed probabalistically."""
-        context_tokens = self.tokenizer(context, return_tensors="pt")
+    def encode_bits(self, ciphertext: List[bool], cur_index: int, context_tokens: List[str]) -> Tuple[str, int]:
+        """At the current position of the ciphertext, return a decoded token and the number of bits consumed probabalistically.
+        Inputs:
+        - ciphertext: A list of bools
+        - cur_index: The current read head position in the ciphertext
+        - context_tokens: Pre-tokenized context, containing up to all bits already encoded
+
+        Outputs:
+        - token: The text (decoded) token to append to running state for iteration
+        - consumed_bits: The number of bits consumed by the token
+        """
+        # Prepare context for inference (requires a list of strings to satisfy API)
+        context: dict = self.tokenizer(context_tokens, return_tensors="pt", is_split_into_words=True)
         with torch.no_grad():
-            logits = self.model(**context_tokens).logits
+            logits = self.model(**context).logits
             probs = torch.softmax(logits, dim=-1)
             top_probs, top_idxs = torch.topk(probs[0, -1], k=CODEBOOK_SIZE)
         # Sort in descending order of probabilities
         top_probs, top_idxs = zip(*sorted(zip(top_probs, top_idxs), reverse=True))
         top_probs = list(top_probs)
         top_idxs = list(top_idxs)
+        top_probs = [tensor.item() for tensor in top_probs]
+        top_idxs = [tensor.item() for tensor in top_idxs]
         # Determine possible codebook indices
         codebook_indices = get_codebook_indices(ciphertext, cur_index)
         # Zero out all scores except for the ones that match the codebook
         total = 0
         for i in range(CODEBOOK_SIZE):
-            if i not in codebook_indices:
+            # Forbid EOS token to continue generation
+            if i not in codebook_indices or top_idxs[i] == self.tokenizer.eos_token_id:
                 top_probs[i] = 0
             else:
                 total += top_probs[i]
@@ -174,41 +189,54 @@ class HiddenMonologue:
         rand = _sec_randfloat()
         for i in range(CODEBOOK_SIZE):
             if top_probs[i] >= rand:
-                print(f"Selected token: {i} (codeword: {pp_codebook_id(i)}, {top_probs[i]*100:.2f}%): \"{self.tokenizer.decode(top_idxs[i], clean_up_tokenization_spaces=False)}\"\n-----------------")
-                return self.tokenizer.decode(top_idxs[i], clean_up_tokenization_spaces=False), len(codebook[i])
+                print(f"Selected token: {i} (codeword: {pp_codebook_id(i)}, {top_probs[i]*100:.2f}%): \"{self.tokenizer.decode(top_idxs[i], clean_up_tokenization_spaces=False)}\"\n{len(ciphertext)-cur_index-len(codebook[i])} bits remain\n-----------------")
+                return self.tokenizer.convert_ids_to_tokens(top_idxs[i]), len(codebook[i])
             rand -= top_probs[i]
     def reset_chat(self):
         self.chat = "<|system|>"+self.system_prompt+"<|end|>\n<|assistant|>"
+        self.token_sequence = self.tokenizer(self.chat, return_tensors="pt")["input_ids"].tolist()[0]
+        self.output_start_index = len(self.token_sequence)
     def encode(self, plaintext) -> str:
         """Encrypts a plaintext message into ciphertext using the password, then encodes it into a monologue."""
-        # TODO: It turns out that using text directly is lossy and doesn't preserve spaces. This has to be refactored to use token lists and only decode at the final step. Add a token list to the class and refactor the code to use it.
         self.reset_chat()
+        # Our running state, which starts with an empty chat containing the system prompt
+        context_tokens = self.tokenizer.convert_ids_to_tokens(self.token_sequence)
         sm = _SecretMessageFactory.from_plaintext(plaintext, self.password)
         ciphertext = _bytes_to_bools(sm.ciphertext)
         cur_index = 0
         while cur_index < len(ciphertext):
-            token, consumed_bits = self.encode_bits(ciphertext, cur_index, self.chat)
-            self.chat += token
+            token, consumed_bits = self.encode_bits(ciphertext, cur_index, context_tokens)
+            context_tokens.append(token)
+            self.token_sequence.append(self.tokenizer.convert_tokens_to_ids(token))
             cur_index += consumed_bits
-        # If we are not at <|end|> yet, continue the conversation with normal generation
-        if "<|end|>" not in self.chat:
-            self.chat += self.tokenizer.decode(self.model.generate(self.tokenizer(self.chat, return_tensors="pt")["input_ids"], max_length=512, do_sample=True, pad_token_id=self.tokenizer.eos_token_id, num_return_sequences=1)[0], clean_up_tokenization_spaces=False)
-        return self.chat
+        # Continue generation (we are guaranteed to not have EOS yet)
+        inputs = self.tokenizer(context_tokens, return_tensors="pt", is_split_into_words=True)
+        output = self.model.generate(**inputs, max_length=512, do_sample=True, pad_token_id=self.tokenizer.eos_token_id, num_return_sequences=1)[0]
+        self.token_sequence = output.tolist()
+        self.chat = self.tokenizer.decode(self.token_sequence, clean_up_tokenization_spaces=False)
+        return self.tokenizer.decode(self.token_sequence[:self.output_start_index], clean_up_tokenization_spaces=False)
     def decode(self, llm_generated_text: str) -> str:
         """Decodes a hidden plaintext message from a block of text, encrypted."""
         self.reset_chat()
         tokenized_chat = self.tokenizer(self.chat, return_tensors="pt")
-        cur_index = 0
+        tokens_to_add = self.tokenizer(llm_generated_text, return_tensors="pt")["input_ids"]
         ciphertext: List[bool] = []
         # Decode recent tokens until we reach the end of the tokenized chat. At each iteration, add the corresponding codebook entry to the ciphertext.
-        for token_decoding_index in range(tokenized_chat["input_ids"]):
-            ciphertext += codebook[self.decode_recent_token(tokenized_chat, token_decoding_index)]
+        for i in range(len(tokens_to_add)):
+            token_decoding_index = len(tokenized_chat["input_ids"]) + i
+            token = self.decode_recent_token(tokenized_chat, token_decoding_index)
+            ciphertext += codebook[token]
+            tokenized_chat["input_ids"] = torch.cat((tokenized_chat["input_ids"], tokens_to_add[i].unsqueeze(0)), dim=1)
         # Pack into a bytestring, and then decrypt
         sm = _SecretMessageFactory.from_ciphertext(_bools_to_bytes(ciphertext), self.password)
-        return sm.plaintext
+        return sm.plaintext[self.output_start_index:]
 
-class HiddenConversation:
-    def __init__(self, tokenizer, model, system_prompt: str, password: str):
-        self.tokenizer = tokenizer
-        self.model = model
-        # TODO finish constructor
+class HiddenConversation(HiddenMonologue):
+    def __init__(self, tokenizer: AutoTokenizer, model: AutoModelForCausalLM, system_prompt: str, password: str):
+        super().__init__(tokenizer, model, system_prompt, password)
+    def encode_message(self, plaintext: str) -> str:
+        """Generate message from secret plaintext and append to chat. Return encoded new message."""
+        pass
+    def push_message(self, message: str) -> str:
+        """Push known secret message from other party into chat. Return secret plaintext message."""
+        pass

@@ -8,8 +8,11 @@ pynacl = "*"
 torch = "*"
 transformers = {git = "git+https://github.com/huggingface/transformers"}
 blake3 = "*"
+packaging = "*"
+ninja = "*"
+setuptools = "*"
 
 [dev-packages]
 
 [requires]
-python_version = "3.11"
+python_version = "3.12"
