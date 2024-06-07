@@ -10,9 +10,13 @@ from nacl.exceptions import CryptoError
 import blake3
 import torch
 
+_ = torch.set_default_device("cuda") if torch.cuda.is_available() else torch.set_default_device("cpu")
+
 CPU = -1
 BLAKE3_DIGEST_SIZE = 32
 BLAKE3_KEY_SIZE = 32
+
+FORBIDDEN_TOKENS = (32000, 32007)
 
 def _sec_randfloat() -> float:
     """Securely returns a uniformly random float in [0.0, 1.0), for selecting tokens from probability distribution."""
@@ -67,12 +71,9 @@ class _SecretMessageFactory:
         nonce: bytes = nacl_utils.random(secret.SecretBox.NONCE_SIZE)
         ciphertext: bytes = box.encrypt(plaintext_bytes, nonce)
         mac_chksum: bytes = blake3.blake3(ciphertext, key=key_mac).digest(length=BLAKE3_DIGEST_SIZE)
-        sm = _SecretMessage()
         # Whenever 0x03 is found, the decoder will check if the following MAC is valid, terminating if it is.
         # This prevents the environment from figuring out that there is a hidden message since the MAC will appear random.
-        sm.ciphertext = salt + ciphertext + bytes.fromhex("03") + mac_chksum
-        sm.plaintext = plaintext
-        return sm
+        return _SecretMessage(salt + ciphertext + bytes.fromhex("03") + mac_chksum, plaintext)
     @staticmethod
     def from_ciphertext(ciphertext: bytes, password: str) -> _SecretMessage:
         """Takes a ciphertext bytestream directly obtained from decoding bytes from a token sequence and returns a _SecretMessage object."""
@@ -89,11 +90,10 @@ class _SecretMessageFactory:
                 candidate_mac = ciphertext[i+1:i+1+BLAKE3_DIGEST_SIZE]
                 computed_mac = blake3.blake3(ciphertext[:i], key=key_mac).digest(length=BLAKE3_DIGEST_SIZE)
                 if candidate_mac == computed_mac:
-                    sm = _SecretMessage()
-                    sm.ciphertext = ciphertext[:i]
+                    c = ciphertext[:i]
                     try:
-                        sm.plaintext = lzma.decompress(box.decrypt(sm.ciphertext)).decode()
-                        return sm
+                        m = lzma.decompress(box.decrypt(c)).decode()
+                        return _SecretMessage(c, m)
                     except CryptoError:
                         pass
         if not eot_detected:
@@ -120,7 +120,7 @@ def get_codebook_indices(ciphertext: List[bool], cur_index: int) -> List[int]:
 class HiddenMonologue:
     """Represents a secure abstraction for hiding a secret in a single instance of a large language model's output.
     Can be used to send a single message notoriously over an insecure channel, or for hiding seemingly innocuous data at rest."""
-    def __init__(self, tokenizer: AutoTokenizer, model: AutoModelForCausalLM, system_prompt: str, password: str, temperature: float = 5.0):
+    def __init__(self, tokenizer: AutoTokenizer, model: AutoModelForCausalLM, system_prompt: str, password: str, temperature: float = 0.7):
         """
         Initializes a HiddenMonologue object with a tokenizer, model, system prompt, and password.
         Inputs:
@@ -130,7 +130,7 @@ class HiddenMonologue:
             - Good Example: "Assistant writes a simple travel guide for Venice."
             - Bad Example: "Typeset the heat equation in LaTeX."
         - password: The shared secret password to use for authenticated encryption and decryption of hidden messages.
-        - temperature (default 5.0): Creativity of the output text.
+        - temperature (default 0.7): Creativity of the output text.
             - Higher values increase encoding efficiency by giving higher probability to longer codewords (which consume more bits), while lower values may produce more logical text.
             - Values too low may cause strange sounding text since rejection sampling is used, giving a mix of coherent text and gibberish.
         
@@ -195,13 +195,16 @@ class HiddenMonologue:
         total = 0
         for i in range(CODEBOOK_SIZE):
             # Forbid EOS token to continue generation
-            if i not in codebook_indices or top_idxs[i] == self.tokenizer.eos_token_id:
+            if i not in codebook_indices or top_idxs[i] in FORBIDDEN_TOKENS:
                 top_probs[i] = 0
             else:
                 total += top_probs[i]
         # Renormalize the scores to sum to 1.0
         for i in range(CODEBOOK_SIZE-1):
-            top_probs[i] /= total
+            try:
+                top_probs[i] /= total
+            except ZeroDivisionError:
+                pass
         # Ensure sum is 1.0 in case of floating point errors
         top_probs[-1] = 1 - sum(top_probs[:-1])
         # Show eligible tokens
@@ -245,10 +248,10 @@ class HiddenMonologue:
             cur_index += consumed_bits
         # Continue generation (we are guaranteed to not have EOS yet)
         inputs = self.tokenizer(context_tokens, return_tensors="pt", is_split_into_words=True)
-        output = self.model.generate(**inputs, max_length=512, do_sample=True, pad_token_id=self.tokenizer.eos_token_id, num_return_sequences=1)[0]
+        output = self.model.generate(**inputs, max_new_tokens=512, do_sample=True, pad_token_id=self.tokenizer.eos_token_id, num_return_sequences=1)[0]
         self.token_sequence = output.tolist()
-        self.chat = self.tokenizer.decode(self.token_sequence, clean_up_tokenization_spaces=False)
-        return self.tokenizer.decode(self.token_sequence[:self.output_start_index], clean_up_tokenization_spaces=False)
+        self.chat = self.tokenizer.decode(self.token_sequence, clean_up_tokenization_spaces=True)
+        return self.tokenizer.decode(self.token_sequence[:self.output_start_index], clean_up_tokenization_spaces=True)
     def decode(self, llm_generated_text: str) -> str:
         """Decodes a hidden plaintext message from a block of text, encrypted."""
         self.reset_chat()
