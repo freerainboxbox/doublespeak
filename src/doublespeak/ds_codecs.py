@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import List, Tuple, Optional
 from secrets import randbelow
 import lzma
@@ -17,17 +18,15 @@ def _sec_randfloat() -> float:
     """Securely returns a uniformly random float in [0.0, 1.0), for selecting tokens from probability distribution."""
     return randbelow(2**32) / 2**32
 
-# Read at current position of ciphertext the next 1, 2, 3, 4 bit windows, and the indices of the codebook that match tell us all eligible tokens.
-# Then, zero out all other logits, and renormalize the logits to sum to 1.0. Then, sample from the distribution.
-def gen_codebook(num_bits: int):
-    codebook = []
+def _gen_codebook(num_bits: int):
+    cb = []
     for bits in range(1, num_bits+1):
         for i in range(2**bits):
             code = tuple(bool(int(bit)) for bit in format(i, f"0{bits}b"))
-            codebook.append(code)
-    return tuple(codebook)
+            cb.append(code)
+    return tuple(cb)
 
-codebook = gen_codebook(4)
+codebook = _gen_codebook(4)
 
 def pp_codebook_id(codebook_id: int) -> str:
     """Pretty-prints a codebook ID as a binary string."""
@@ -47,6 +46,7 @@ def _bools_to_bytes(bits: List[bool]) -> bytes:
     return bytes(int("".join(map(str, bits[i:i+8])), 2) for i in range(0, len(bits), 8))
 
 # NOTE: _SecretMessage is meant to be immutable
+@dataclass
 class _SecretMessage:
     ciphertext: bytes
     plaintext: str
@@ -118,7 +118,27 @@ def get_codebook_indices(ciphertext: List[bool], cur_index: int) -> List[int]:
         
 
 class HiddenMonologue:
-    def __init__(self, tokenizer: AutoTokenizer, model: AutoModelForCausalLM, system_prompt: str, password: str):
+    """Represents a secure abstraction for hiding a secret in a single instance of a large language model's output.
+    Can be used to send a single message notoriously over an insecure channel, or for hiding seemingly innocuous data at rest."""
+    def __init__(self, tokenizer: AutoTokenizer, model: AutoModelForCausalLM, system_prompt: str, password: str, temperature: float = 5.0):
+        """
+        Initializes a HiddenMonologue object with a tokenizer, model, system prompt, and password.
+        Inputs:
+        - tokenizer: The tokenizer to use for encoding and decoding text (see utils.py for example).
+        - model: The model to use for encoding and decoding text (see utils.py for example). Tokenizer should be derived from this model.
+        - system_prompt: The system prompt to use for the chat. Good system prompts nudge the assistant to generate natural text with little to no special formatting, and specifically prompts the assistant to generate one thing only.
+            - Good Example: "Assistant writes a simple travel guide for Venice."
+            - Bad Example: "Typeset the heat equation in LaTeX."
+        - password: The shared secret password to use for authenticated encryption and decryption of hidden messages.
+        - temperature (default 5.0): Creativity of the output text.
+            - Higher values increase encoding efficiency by giving higher probability to longer codewords (which consume more bits), while lower values may produce more logical text.
+            - Values too low may cause strange sounding text since rejection sampling is used, giving a mix of coherent text and gibberish.
+        
+        Note that identical objects with identical plaintext will not produce identical outputs, as multiple computations are probabilistic.
+        """
+        # USER: For custom temperatures, it must be a shared secret, as top-k ordering is not invariant to temperature
+        self.temperature = temperature
+        self.coldness = 1.0 / temperature # For logits multiply (faster than division)
         self.tokenizer: AutoTokenizer = tokenizer
         self.model: AutoModelForCausalLM = model
         self.system_prompt: str = system_prompt
@@ -133,6 +153,8 @@ class HiddenMonologue:
         tokens_so_far["input_ids"] = tokens_so_far["input_ids"][:token_decoding_index]
         with torch.no_grad():
             logits = self.model(**tokens_so_far).logits
+            # Apply temperature scaling (logits * coldness)
+            torch.mul(logits, self.coldness, out=logits)
             probs = torch.softmax(logits, dim=-1)
             top_probs, top_idxs = torch.topk(probs[0, -1], k=CODEBOOK_SIZE)
         # Sort in descending order of probabilities
@@ -142,11 +164,12 @@ class HiddenMonologue:
             if codebook[top_idxs[i]] == tokens_so_far["input_ids"][-1]:
                 return i
     def encode_bits(self, ciphertext: List[bool], cur_index: int, context_tokens: List[str]) -> Tuple[str, int]:
-        """At the current position of the ciphertext, return a decoded token and the number of bits consumed probabalistically.
+        """
+        At the current position of the ciphertext, return a decoded token and the number of bits consumed probabalistically.
         Inputs:
-        - ciphertext: A list of bools
-        - cur_index: The current read head position in the ciphertext
-        - context_tokens: Pre-tokenized context, containing up to all bits already encoded
+        - ciphertext: A list of bools, containing the raw encoding of the text (bits grow from LSB to MSB).
+        - cur_index: The current read head position in the ciphertext.
+        - context_tokens: Pre-tokenized context, containing up to all bits already encoded.
 
         Outputs:
         - token: The text (decoded) token to append to running state for iteration
@@ -156,6 +179,8 @@ class HiddenMonologue:
         context: dict = self.tokenizer(context_tokens, return_tensors="pt", is_split_into_words=True)
         with torch.no_grad():
             logits = self.model(**context).logits
+            # Apply temperature scaling (logits * coldness)
+            torch.mul(logits, self.coldness, out=logits)
             probs = torch.softmax(logits, dim=-1)
             top_probs, top_idxs = torch.topk(probs[0, -1], k=CODEBOOK_SIZE)
         # Sort in descending order of probabilities
@@ -193,11 +218,20 @@ class HiddenMonologue:
                 return self.tokenizer.convert_ids_to_tokens(top_idxs[i]), len(codebook[i])
             rand -= top_probs[i]
     def reset_chat(self):
+        """Resets the chat to the system prompt."""
         self.chat = "<|system|>"+self.system_prompt+"<|end|>\n<|assistant|>"
         self.token_sequence = self.tokenizer(self.chat, return_tensors="pt")["input_ids"].tolist()[0]
         self.output_start_index = len(self.token_sequence)
-    def encode(self, plaintext) -> str:
-        """Encrypts a plaintext message into ciphertext using the password, then encodes it into a monologue."""
+    def encode(self, plaintext: str) -> str:
+        """
+        Encrypts a plaintext message into ciphertext using the password, then encodes it into a monologue.
+        Chat state and internal token sequence is mutated to contain formatted system prompt concatenated with generated text.
+
+        Inputs:
+        - plaintext: The plaintext message to encode
+        Outputs:
+        - The encoded monologue containing the ciphertext, without formatting
+        """
         self.reset_chat()
         # Our running state, which starts with an empty chat containing the system prompt
         context_tokens = self.tokenizer.convert_ids_to_tokens(self.token_sequence)
@@ -222,11 +256,11 @@ class HiddenMonologue:
         tokens_to_add = self.tokenizer(llm_generated_text, return_tensors="pt")["input_ids"]
         ciphertext: List[bool] = []
         # Decode recent tokens until we reach the end of the tokenized chat. At each iteration, add the corresponding codebook entry to the ciphertext.
-        for i in range(len(tokens_to_add)):
+        for i, token_to_add in enumerate(tokens_to_add):
             token_decoding_index = len(tokenized_chat["input_ids"]) + i
             token = self.decode_recent_token(tokenized_chat, token_decoding_index)
             ciphertext += codebook[token]
-            tokenized_chat["input_ids"] = torch.cat((tokenized_chat["input_ids"], tokens_to_add[i].unsqueeze(0)), dim=1)
+            tokenized_chat["input_ids"] = torch.cat((tokenized_chat["input_ids"], token_to_add.unsqueeze(0)), dim=1)
         # Pack into a bytestring, and then decrypt
         sm = _SecretMessageFactory.from_ciphertext(_bools_to_bytes(ciphertext), self.password)
         return sm.plaintext[self.output_start_index:]
