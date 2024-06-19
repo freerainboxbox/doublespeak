@@ -24,3 +24,8 @@ We can then decode by reverse-matching the predictions to our code-table to reco
 Conversations may also work, as long as total conversation length + system prompt does not exceed the 128k window. The ciphertext is always aligned at the message boundary in this case.
 
 It may also be possible to do an ad-hoc key exchange for parties that cannot securely establish a shared secret beforehand. Some public form of randomness that is slow to change would work as a "key" in this case, used to share public parameters. The easiest method of doing this is simply using the [most recent Bitcoin block hash](https://blockchair.com/bitcoin/blocks) as a 256-bit key.
+
+## Current Roadblocks
+
+- Encryption/compression overhead is very high, sizes blow up to at least 1 kilobit. Need to profile space consumption of lzma and potentially use `cryptography.hazmat` for low-level primitives to reduce space usage.  
+- Regardless of temperature, model starts spewing nonsense tokens at the end, including a lot of whitespace, "<" and ">", etc. Need better prompt guidelines, or just more model fine-tuning to heavily penalize special formatting.
